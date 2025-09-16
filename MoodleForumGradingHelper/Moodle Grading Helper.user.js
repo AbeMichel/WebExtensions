@@ -19,7 +19,8 @@
   let index = 0;
   let isTransitioning = false;
   let isMinimized = false;
-
+	let jumpPopup, jumpInput, resultsDropdown;
+  
   // DOM elements
   let toolbar, status, nextButton, prevButton, skipCheckbox;
 
@@ -43,6 +44,19 @@
     return `${parts[0]} ${parts[parts.length - 1]}`;
   }
 
+   /**
+   * Returns the first name from full name
+   */
+  function getFirstName(fullName) {
+    if (!fullName) { return ""; }
+
+    const parts = fullName.trim().split(/\s+/);
+    if (parts.length <= 1) { return fullName; } // Only a first name
+
+    // Return first name only
+    return `${parts[0]}`;
+  }
+  
   /**
    * Upload and read CSV file
    */
@@ -87,16 +101,15 @@
         .split("\n")
         .map(line => line.split(",").map(cell => cell.trim()));
 
-      // Filter by key (column 5 = group) and remove middle names
+      // Filter by key (column 5 = group) and keep middle names for now
       students = rows
         .filter(cols => cols[GROUP_COL] && cols[GROUP_COL].toLowerCase() === key.toLowerCase())
-        .map(cols => removeMiddleName(cols[FULL_NAME_COL]));
+      	.map(cols => cols[FULL_NAME_COL]);
 
       index = 0;
       if (students.length > 0) {
         await openSearchToggle();
-        await fillStudent(students[index]);
-        await selectStudent();
+        await trySelectingStudentAllPermutations(index);
       }
 
       alert(`Loaded ${students.length} students for group "${key}".`);
@@ -204,15 +217,15 @@
       const studentButtons = document.querySelectorAll("button[data-action='select-user']");
 
       if (!studentButtons || studentButtons.length === 0) {
-        alert("No students found in search results!");
+//         alert("No students found in search results!");
         updateStatus();
-        return;
+        return false;
       }
 
       if (studentButtons.length > 1) {
         alert("More than 1 possible student. Select yourself.");
         updateStatus();
-        return;
+        return true;
       }
 
       studentButtons[0].dispatchEvent(new MouseEvent("click", {
@@ -220,13 +233,31 @@
         cancelable: true,
         view: window
       }));
-
       updateStatus();
+      return true;
     } catch (err) {
       console.error("Error selecting student:", err);
+      return false;
     }
   }
 
+  async function trySelectingStudentAllPermutations(index) {
+    var name = students[index];
+    var res = false;
+    await fillStudent(name);
+    res = await selectStudent();
+    if (!res) { 
+    	await fillStudent(removeMiddleName(name));
+      res = await selectStudent();
+      if (!res) {
+        await fillStudent(getFirstName(name));
+        res = await selectStudent();
+      }
+    }
+    
+    if (!res) { alert(`Unable to find definitive student with name: ${name}`); }
+  }
+  
   /**
    * Navigate to next student
    */
@@ -236,10 +267,15 @@
 
     if (saveGrade) { await saveStudentGrade(); }
 
+    if (index >= students.length) {
+      alert("All students graded");
+      isTransitioning = false;
+      return;
+    }
+    
     while (index < students.length) {
       await openSearchToggle();
-      await fillStudent(students[index]);
-      await selectStudent();
+      await trySelectingStudentAllPermutations(index);
 
       if (skipCheckbox.checked) {
         const graded = await isGraded();
@@ -251,10 +287,6 @@
 
       index++;
       break;
-    }
-
-    if (index >= students.length) {
-      alert("All students graded");
     }
 
     isTransitioning = false;
@@ -270,24 +302,6 @@
     } else {
       alert("Already at first student");
     }
-  }
-
-  /**
-   * Jump to specific student by number
-   */
-  async function jumpToStudent() {
-    const targetNumber = prompt(`Enter student number (1-${students.length}):`);
-    if (!targetNumber) { return; }
-
-    const targetIndex = parseInt(targetNumber) - 1;
-
-    if (isNaN(targetIndex) || targetIndex < 0 || targetIndex >= students.length) {
-      alert(`Invalid student number. Please enter a number between 1 and ${students.length}.`);
-      return;
-    }
-
-    index = targetIndex;
-    await fillNextStudent();
   }
 
   /**
@@ -329,6 +343,158 @@
     }
   }
 
+  function showJumpPopup() {
+    if (jumpPopup) { closeJumpPopup(); return; }
+    
+    const gradingWindow = document.querySelectorAll(".unified-grader")[0];
+    
+    jumpPopup = document.createElement("div");
+    Object.assign(jumpPopup.style, {
+      position: "absolute",
+      top: "40px",
+      left: "10px",
+      background: "#222",
+      border: "1px solid #555",
+      borderRadius: "6px",
+      padding: "8px",
+      zIndex: "9999999",
+      pointerEvents: "auto",
+      boxShadow: "0 2px 8px rgba(0,0,0,0.5)"
+    });
+    
+    jumpInput = document.createElement("input");
+    Object.assign(jumpInput.style, {
+      width: "200px",
+      padding: "4px",
+      fontSize: "13px",
+      borderRadius: "4px",
+      pointerEvents: "auto",
+      border: "1px solid #888"
+    });
+    jumpInput.placeholder = "Enter # or name";
+    jumpInput.addEventListener('click', () => {jumpInput.focus({ focusVisible: true });});
+    
+    // Results dropdown
+    resultsDropdown = document.createElement("div");
+    Object.assign(resultsDropdown.style, {
+      marginTop: "6px",
+      maxHeight: "120px",
+      overflowY: "auto",
+      fontSize: "13px",
+      color: "#eee"
+    });
+    
+    jumpPopup.appendChild(jumpInput);
+    jumpPopup.appendChild(resultsDropdown);
+    if (gradingWindow) { gradingWindow.appendChild(jumpPopup); }
+    else { toolbar.appendChild(jumpPopup); }
+
+    jumpInput.focus();
+
+    // Input handlers
+    jumpInput.addEventListener("input", handleJumpSearch);
+    jumpInput.addEventListener("keydown", async (e) => {
+      if (e.key === "Enter") {
+        await executeJump(jumpInput.value.trim());
+      } else if (e.key === "Escape") {
+        closeJumpPopup();
+      }
+    });
+    
+    // Outside click closes
+    document.addEventListener("mousedown", outsideClickClose);
+    
+//     setTimeout(() => jumpInput.focus({ preventScroll: true }), 50);
+  }
+  
+  function closeJumpPopup() {
+    if (jumpPopup) {
+      jumpPopup.remove();
+      jumpPopup = null;
+      jumpInput = null;
+      resultsDropdown = null;
+      document.removeEventListener("mousedown", outsideClickClose);
+    }
+  }
+
+  function outsideClickClose(e) {
+    if (jumpPopup && !jumpPopup.contains(e.target) && e.target !== status) {
+      closeJumpPopup();
+    }
+  }
+  
+  
+  function handleJumpSearch() {
+    if (!resultsDropdown) { return; }
+    resultsDropdown.innerHTML = "";
+
+    const query = jumpInput.value.trim();
+    if (!query) { return; }
+
+    const num = parseInt(query);
+    if (!isNaN(num) && num > 0 && num <= students.length) {
+      const name = students[num - 1];
+      const option = createResultOption(name, num - 1);
+      resultsDropdown.appendChild(option);
+      return;
+    }
+
+    // Otherwise, search names
+    const lowerQuery = query.toLowerCase();
+    const matches = students
+      .map((name, idx) => ({ name, idx }))
+      .filter(s => s.name.toLowerCase().includes(lowerQuery))
+      .slice(0, 5);
+
+    matches.forEach(({ name, idx }) => {
+      const option = createResultOption(name, idx);
+      resultsDropdown.appendChild(option);
+    });
+  }
+
+  function createResultOption(name, idx) {
+    const div = document.createElement("div");
+    div.textContent = `${idx + 1}. ${name}`;
+    Object.assign(div.style, {
+      padding: "2px 4px",
+      cursor: "pointer"
+    });
+    div.addEventListener("mouseenter", () => div.style.background = "#444");
+    div.addEventListener("mouseleave", () => div.style.background = "transparent");
+    div.addEventListener("click", async () => {
+      await jumpToIndex(idx);
+      closeJumpPopup();
+    });
+    return div;
+  }
+
+  async function executeJump(query) {
+    if (!query) { return; }
+
+    const num = parseInt(query);
+    if (!isNaN(num) && num > 0 && num <= students.length) {
+      await jumpToIndex(num - 1);
+      closeJumpPopup();
+      return;
+    }
+
+    const lowerQuery = query.toLowerCase();
+    const idx = students.findIndex(name => name.toLowerCase().includes(lowerQuery));
+    if (idx !== -1) {
+      await jumpToIndex(idx);
+      closeJumpPopup();
+    } else {
+      alert(`No match found for "${query}"`);
+    }
+  }
+
+  async function jumpToIndex(idx) {
+    index = idx;
+    await fillNextStudent(false);
+  }
+
+  
+  
   /**
    * Initialize toolbar
    */
@@ -353,7 +519,7 @@
       display: "flex",
       gap: "10px",
       alignItems: "center",
-      zIndex: "9999",
+      zIndex: "999999",
       fontFamily: "sans-serif",
       fontSize: "14px",
       boxShadow: "0 2px 5px rgba(0,0,0,0.2)"
@@ -379,7 +545,7 @@
     // Add the minimize button early so it's before the group buttons
     toolbar.appendChild(minimizeButton);
 
-    // Create the group buttons
+    // Create the group dropdown
     GROUPS.forEach(group => {
       if (!group.trim() || group.trim() === "") { return; }
       const groupButton = createButton(`Load ${group}`, () => loadStudentsFromFile(group), "#042ad1");
@@ -423,7 +589,9 @@
       backgroundColor: "rgba(255,255,255,0.1)"
     });
 
-    status.addEventListener("click", jumpToStudent);
+    status.addEventListener("click", () => {
+      showJumpPopup();
+    });
     status.textContent = "Student 0/0";
 
     // Add hover effect to status
@@ -433,7 +601,8 @@
     status.addEventListener("mouseleave", () => {
       status.style.backgroundColor = "rgba(255,255,255,0.1)";
     });
-
+    
+    
     toolbar.appendChild(prevButton);
     toolbar.appendChild(nextButton);
     toolbar.appendChild(resetButton);
@@ -464,7 +633,7 @@
             break;
           case "j":
             e.preventDefault();
-            jumpToStudent();
+            showJumpPopup();
             break;
         }
       }

@@ -14,9 +14,10 @@ A userscript that adds a toolbar to Moodle forums, allowing instructors and TAs 
   - Navigate to previous/next student of the group
   - Reset to the first student in the group
   - Minimize the toolbar to reduce obstruction
+  - Search for students based on their number in the roll or name
 - Status display: shows `Student X/Y` of current progress
 - Tooltip on buttons showing the name of the next/previous student
-- Auto-skip graded students (optional checkbox)
+- Auto-skip graded students (optional checkbox) (WIP)
 - Checks if uploaded CSV file is more than 7 days old
 
 ---
@@ -86,7 +87,7 @@ A userscript that adds a toolbar to Moodle forums, allowing instructors and TAs 
 
 6. **Status Display**  
    - Shows the current student index and total students (`Student X/Y`).
-   - Click to be prompted to jump to a specific student number.
+   - Click to be prompted to jump to a specific student number or name.
    - Hover over the next/previous buttons to see the name of the corresponding student.
 
 ---
@@ -110,3 +111,11 @@ A userscript that adds a toolbar to Moodle forums, allowing instructors and TAs 
 ## License
 
  [MIT License](../LICENSE)
+
+
+## Changelog
+
+**9/16/2025**
+- Improved the auto search function to check for the full name, then the name without a middle name, and finally only the first name.
+
+- Implemented functionality for searching students by name or by number in list.
