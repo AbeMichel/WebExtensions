@@ -20,7 +20,7 @@
   let isTransitioning = false;
   let isMinimized = false;
 	let jumpPopup, jumpInput, resultsDropdown;
-  
+
   // DOM elements
   let toolbar, status, nextButton, prevButton, skipCheckbox;
 
@@ -56,7 +56,7 @@
     // Return first name only
     return `${parts[0]}`;
   }
-  
+
   /**
    * Upload and read CSV file
    */
@@ -246,7 +246,7 @@
     var res = false;
     await fillStudent(name);
     res = await selectStudent();
-    if (!res) { 
+    if (!res) {
     	await fillStudent(removeMiddleName(name));
       res = await selectStudent();
       if (!res) {
@@ -254,10 +254,10 @@
         res = await selectStudent();
       }
     }
-    
+
     if (!res) { alert(`Unable to find definitive student with name: ${name}`); }
   }
-  
+
   /**
    * Navigate to next student
    */
@@ -272,7 +272,7 @@
       isTransitioning = false;
       return;
     }
-    
+
     while (index < students.length) {
       await openSearchToggle();
       await trySelectingStudentAllPermutations(index);
@@ -345,9 +345,9 @@
 
   function showJumpPopup() {
     if (jumpPopup) { closeJumpPopup(); return; }
-    
+
     const gradingWindow = document.querySelectorAll(".unified-grader")[0];
-    
+
     jumpPopup = document.createElement("div");
     Object.assign(jumpPopup.style, {
       position: "absolute",
@@ -361,7 +361,7 @@
       pointerEvents: "auto",
       boxShadow: "0 2px 8px rgba(0,0,0,0.5)"
     });
-    
+
     jumpInput = document.createElement("input");
     Object.assign(jumpInput.style, {
       width: "200px",
@@ -373,7 +373,7 @@
     });
     jumpInput.placeholder = "Enter # or name";
     jumpInput.addEventListener('click', () => {jumpInput.focus({ focusVisible: true });});
-    
+
     // Results dropdown
     resultsDropdown = document.createElement("div");
     Object.assign(resultsDropdown.style, {
@@ -383,7 +383,7 @@
       fontSize: "13px",
       color: "#eee"
     });
-    
+
     jumpPopup.appendChild(jumpInput);
     jumpPopup.appendChild(resultsDropdown);
     if (gradingWindow) { gradingWindow.appendChild(jumpPopup); }
@@ -400,13 +400,13 @@
         closeJumpPopup();
       }
     });
-    
+
     // Outside click closes
     document.addEventListener("mousedown", outsideClickClose);
-    
+
 //     setTimeout(() => jumpInput.focus({ preventScroll: true }), 50);
   }
-  
+
   function closeJumpPopup() {
     if (jumpPopup) {
       jumpPopup.remove();
@@ -422,8 +422,8 @@
       closeJumpPopup();
     }
   }
-  
-  
+
+
   function handleJumpSearch() {
     if (!resultsDropdown) { return; }
     resultsDropdown.innerHTML = "";
@@ -493,8 +493,8 @@
     await fillNextStudent(false);
   }
 
-  
-  
+
+
   /**
    * Initialize toolbar
    */
@@ -601,8 +601,8 @@
     status.addEventListener("mouseleave", () => {
       status.style.backgroundColor = "rgba(255,255,255,0.1)";
     });
-    
-    
+
+
     toolbar.appendChild(prevButton);
     toolbar.appendChild(nextButton);
     toolbar.appendChild(resetButton);
