@@ -2,27 +2,80 @@
 // @name         Moodle Grading Helper Enhanced
 // @description  Adds a button to cycle through student names and fill the search box automatically in Moodle
 // @match        https://moodle-courses2527.wolfware.ncsu.edu/mod/forum/*
-// @version      2.0
+// @version      3.0
+// @grant        none
 // ==/UserScript==
 
 (() => {
   'use strict';
 
+  // Constants
   const TOOLBAR_CLASS = "abes-super-grader-toolbar";
   const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
   const FULL_NAME_COL = 0;
   const GROUP_COL = 5;
   const GROUPS = ["A", "B", "C"];
+  
+  // Timeouts
+  const SEARCH_WAIT_MS = 1000;
+  const NAME_CHANGE_TIMEOUT = 5000;
+  const CHILDREN_WAIT_TIMEOUT = 5000;
+  const DEBOUNCE_DELAY = 300;
 
-  let fileString = "";
-  let students = [];
-  let index = 0;
-  let isTransitioning = false;
-  let isMinimized = false;
-	let jumpPopup, jumpInput, resultsDropdown;
+  // State
+  const state = {
+    fileString: "",
+    students: [],
+    index: 0,
+    isTransitioning: false,
+    isMinimized: false,
+    jumpPopup: null,
+    jumpInput: null,
+    resultsDropdown: null
+  };
 
-  // DOM elements
-  let toolbar, status, nextButton, prevButton, skipCheckbox;
+  // DOM elements (cached)
+  const dom = {
+    toolbar: null,
+    status: null,
+    nextButton: null,
+    prevButton: null,
+    skipCheckbox: null,
+    autoGradeZeros: null,
+  };
+
+  // Selectors
+  const SELECTORS = {
+    searchToggle: "button.toggle-search-button",
+    searchInput: "input[data-region='user-search-input']",
+    searchResults: "div[data-region='search-results-container']",
+    selectUserButton: "button[data-action='select-user']",
+    userName: "h5[data-region='name'].user-full-name",
+    statusContainer: "div[data-region='status-container'] h2",
+    saveButton: "button[data-action='savegrade']",
+    gradingWindow: ".unified-grader",
+    scoringPanel: "div[data-region='body-container']",
+    discussionPanel: `div[aria-label="User's forum posts"]`,
+    noPostContainer: ".no-post-container",
+    scoreInput: ".mb-3.criterion .mb-3 input",
+    postInstance: ".posts-container",
+  };
+
+  /**
+   * Utility: Sleep function
+   */
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+  /**
+   * Utility: Debounce function
+   */
+  function debounce(func, delay) {
+    let timeoutId;
+    return function(...args) {
+      clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => func.apply(this, args), delay);
+    };
+  }
 
   /**
    * Check if file is older than 7 days
@@ -32,30 +85,22 @@
   }
 
   /**
-   * Remove middle names from full name
+   * Name manipulation utilities
    */
-  function removeMiddleName(fullName) {
-    if (!fullName) { return ""; }
+  const NameUtils = {
+    removeMiddleName(fullName) {
+      if (!fullName) return "";
+      const parts = fullName.trim().split(/\s+/);
+      if (parts.length <= 2) return fullName;
+      return `${parts[0]} ${parts[parts.length - 1]}`;
+    },
 
-    const parts = fullName.trim().split(/\s+/);
-    if (parts.length <= 2) { return fullName; } // No middle name
-
-    // Return first and last name only
-    return `${parts[0]} ${parts[parts.length - 1]}`;
-  }
-
-   /**
-   * Returns the first name from full name
-   */
-  function getFirstName(fullName) {
-    if (!fullName) { return ""; }
-
-    const parts = fullName.trim().split(/\s+/);
-    if (parts.length <= 1) { return fullName; } // Only a first name
-
-    // Return first name only
-    return `${parts[0]}`;
-  }
+    getFirstName(fullName) {
+      if (!fullName) return "";
+      const parts = fullName.trim().split(/\s+/);
+      return parts[0] || fullName;
+    }
+  };
 
   /**
    * Upload and read CSV file
@@ -67,19 +112,19 @@
       input.accept = ".csv";
 
       input.addEventListener("change", (e) => {
-        const file = e.target.files[0];
-        if (!file) { return reject("No file selected"); }
+        const file = e.target.files?.[0];
+        if (!file) return reject(new Error("No file selected"));
 
         if (isFileStale(file)) {
-          alert("Grading roll is over 7 days old. Consider downloading a new roll to avoid stale data.");
+          alert("⚠️ Grading roll is over 7 days old. Consider downloading a new roll to avoid stale data.");
         }
 
         const reader = new FileReader();
         reader.onload = (event) => {
-          fileString = event.target.result;
-          resolve(fileString);
+          state.fileString = event.target.result;
+          resolve(state.fileString);
         };
-        reader.onerror = reject;
+        reader.onerror = () => reject(new Error("Failed to read file"));
         reader.readAsText(file);
       });
 
@@ -92,60 +137,88 @@
    */
   async function loadStudentsFromFile(key) {
     try {
-      if (!fileString || fileString.trim() === "") {
+      if (!state.fileString || state.fileString.trim() === "") {
         await uploadCSV();
       }
 
-      const rows = fileString
+      const rows = state.fileString
         .trim()
         .split("\n")
-        .map(line => line.split(",").map(cell => cell.trim()));
+        .map(line => line.split(",").map(cell => cell.trim()))
+        .filter(cols => cols.length > GROUP_COL); // Validate row has enough columns
 
-      // Filter by key (column 5 = group) and keep middle names for now
-      students = rows
-        .filter(cols => cols[GROUP_COL] && cols[GROUP_COL].toLowerCase() === key.toLowerCase())
-      	.map(cols => cols[FULL_NAME_COL]);
+      // Filter by group and extract names
+      state.students = rows
+        .filter(cols => cols[GROUP_COL]?.toLowerCase() === key.toLowerCase())
+        .map(cols => cols[FULL_NAME_COL])
+        .filter(name => name && name.trim() !== ""); // Remove empty names
 
-      index = 0;
-      if (students.length > 0) {
-        await openSearchToggle();
-        await trySelectingStudentAllPermutations(index);
+      if (state.students.length === 0) {
+        alert(`⚠️ No students found for group "${key}". Check your CSV format.`);
+        return;
       }
 
-      alert(`Loaded ${students.length} students for group "${key}".`);
-      updateStatus();
+      // Start at index 0 and navigate to first student
+      state.index = 0;
+      await fillNextStudent(false); // Don't save, just navigate
+
+      alert(`✓ Loaded ${state.students.length} students for group "${key}".`);
     } catch (err) {
-      alert("Failed to load students: " + err);
+      console.error("Error loading students:", err);
+      alert(`❌ Failed to load students: ${err.message}`);
     }
   }
 
   /**
-   * Utility function to wait
+   * Wait for name change in DOM
    */
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  async function waitForNameChange(expectedName, oldName = null, timeout = NAME_CHANGE_TIMEOUT) {
+    const startTime = Date.now();
+    
+    // If no old name provided, get current name
+    if (oldName === null) {
+      const nameElement = document.querySelector(SELECTORS.userName);
+      oldName = nameElement?.innerText.trim() || "";
+    }
+
+    while (Date.now() - startTime < timeout) {
+      const currentElement = document.querySelector(SELECTORS.userName);
+      if (currentElement) {
+        const currentName = currentElement.innerText.trim();
+        if (currentName !== oldName && currentName !== "") {
+          await sleep(200); // Stabilization delay
+          return true;
+        }
+      }
+      await sleep(50);
+    }
+
+    console.warn(`Name did not change from "${oldName}" to "${expectedName}" within ${timeout}ms`);
+    return false;
   }
 
   /**
    * Wait for DOM children to appear
    */
-  function waitForChildren(selector, timeout = 5000) {
+  function waitForChildren(selector, timeout = CHILDREN_WAIT_TIMEOUT) {
     return new Promise((resolve, reject) => {
       const parent = document.querySelector(selector);
-      if (!parent) { return reject(new Error(`Parent not found: ${selector}`)); }
+      if (!parent) {
+        return reject(new Error(`Parent not found: ${selector}`));
+      }
 
-      if (parent.children.length === 1) {
+      if (parent.children.length >= 1) {
         return resolve(parent);
       }
 
       const observer = new MutationObserver(() => {
-        if (parent.children.length === 1) {
+        if (parent.children.length >= 1) {
           observer.disconnect();
           resolve(parent);
         }
       });
 
-      observer.observe(parent, { childList: true });
+      observer.observe(parent, { childList: true, subtree: true });
 
       setTimeout(() => {
         observer.disconnect();
@@ -155,27 +228,92 @@
   }
 
   /**
+   * Scroll to the top of the grading panel and to the first post in the discussion body
+   */
+  function scrollToStartSpot() {
+    const gradingPanel = document.querySelector(SELECTORS.scoringPanel);
+    const discussionPanel = document.querySelector(SELECTORS.discussionPanel);
+
+    if (gradingPanel) {
+      if (typeof gradingPanel.scrollTo === "function"){
+        gradingPanel.scrollTo({ top: 0, behavior: "auto" });
+      } else {
+        gradingPanel.scrollTop = 0;
+      }
+    } else {
+      console.warn("Scoring panel not found");
+    }
+
+    if (discussionPanel) {
+      const posts = document.querySelectorAll(SELECTORS.postInstance);
+      if (posts.length > 0){
+        const lastPost = posts[posts.length - 1];
+        lastPost.scrollIntoView({ behavior: "auto", block: "start" });
+      } else {
+        discussionPanel.scrollTo({ top: 0, behavior: "auto" });
+      }
+    } else {
+      console.warn("Discussion panel not found");
+    }
+  }
+
+  /**
    * Check if current student is already graded
    */
-  async function isGraded() {
-    await sleep(2000);
-    const statusElement = document.querySelector("h2[data-region='status-container']");
-    if (!statusElement) { return false; }
+  function isGraded() {
+    const statusElement = document.querySelector(SELECTORS.statusContainer);
+    if (!statusElement) return false;
     return !statusElement.innerText.toLowerCase().includes("not");
+  }
+
+  /**
+   * Checks if the no post container exists which means there are no posts.
+   * @returns false if the user doesn't have any posts, true otherwise.
+   */
+  function hasPosts() {
+    const noPostElement = document.querySelector(SELECTORS.noPostContainer);
+    return !noPostElement;
+  }
+
+  function focusFirstGradeBox(fillWithZero = false) {
+    const firstGradeBox = document.querySelector(SELECTORS.scoreInput);
+
+    if (!firstGradeBox) {
+      console.warn("No grading input found");
+      return false;
+    }
+
+    // Bring it into view and focus
+    firstGradeBox.scrollIntoView({ behavior: "auto", block: "center" });
+    firstGradeBox.focus();
+
+    // If fillWithZero is requested and the field is numeric or empty
+    if (fillWithZero) {
+      const val = firstGradeBox.value.trim();
+
+      // Only overwrite if empty or numeric
+      if (val === "" || !isNaN(val)) {
+        firstGradeBox.value = 0;
+        // Trigger Moodle's reactive listeners
+        firstGradeBox.dispatchEvent(new Event("input", { bubbles: true }));
+        firstGradeBox.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }
+
+    return true;
   }
 
   /**
    * Save the grading of the current student
    */
   async function saveStudentGrade() {
-    const saveButton = document.querySelector("button[data-action='savegrade']");
-    if (!saveButton) { alert("Could not locate the save button to save grade."); }
+    const saveButton = document.querySelector(SELECTORS.saveButton);
+    if (!saveButton) {
+      console.warn("Save button not found");
+      return;
+    }
 
-    saveButton.dispatchEvent(new MouseEvent("click", {
-        bubbles: true,
-        cancelable: true,
-        view: window
-      }));
+    saveButton.click();
     await sleep(500);
   }
 
@@ -183,27 +321,31 @@
    * Open search toggle
    */
   async function openSearchToggle() {
-    const toggle = document.querySelector("button.toggle-search-button");
-    if (!toggle) { return; }
+    const toggle = document.querySelector(SELECTORS.searchToggle);
+    if (!toggle) {
+      console.warn("Search toggle not found");
+      return;
+    }
 
-    toggle.dispatchEvent(new MouseEvent("click", {
-      bubbles: true,
-      cancelable: true,
-      view: window
-    }));
-    await sleep(50);
+    toggle.click();
+    await sleep(100);
   }
 
   /**
    * Fill student name in search bar
    */
   async function fillStudent(name) {
-    const searchBar = document.querySelector("input[data-region='user-search-input']");
-    if (!searchBar) { return; }
+    const searchBar = document.querySelector(SELECTORS.searchInput);
+    if (!searchBar) {
+      console.warn("Search bar not found");
+      return false;
+    }
 
     searchBar.value = name;
     searchBar.dispatchEvent(new Event("input", { bubbles: true }));
-    await sleep(50);
+    searchBar.dispatchEvent(new Event("change", { bubbles: true }));
+    await sleep(100);
+    return true;
   }
 
   /**
@@ -211,29 +353,23 @@
    */
   async function selectStudent() {
     try {
-      await waitForChildren("div[data-region='search-results-container']", 5000);
-      await sleep(1000);
+      await waitForChildren(SELECTORS.searchResults, CHILDREN_WAIT_TIMEOUT);
+      await sleep(SEARCH_WAIT_MS);
 
-      const studentButtons = document.querySelectorAll("button[data-action='select-user']");
+      const studentButtons = document.querySelectorAll(SELECTORS.selectUserButton);
 
       if (!studentButtons || studentButtons.length === 0) {
-//         alert("No students found in search results!");
-        updateStatus();
+        console.warn("No students found in search results");
         return false;
       }
 
       if (studentButtons.length > 1) {
-        alert("More than 1 possible student. Select yourself.");
-        updateStatus();
-        return true;
+        alert("⚠️ Multiple students match. Please select manually.");
+        return false;
       }
 
-      studentButtons[0].dispatchEvent(new MouseEvent("click", {
-        bubbles: true,
-        cancelable: true,
-        view: window
-      }));
-      updateStatus();
+      studentButtons[0].click();
+      await sleep(200);
       return true;
     } catch (err) {
       console.error("Error selecting student:", err);
@@ -241,67 +377,127 @@
     }
   }
 
+  /**
+   * Try selecting student with all name permutations
+   */
   async function trySelectingStudentAllPermutations(index) {
-    var name = students[index];
-    var res = false;
+    const name = state.students[index];
+    if (!name) {
+      console.error(`No student at index ${index}`);
+      return false;
+    }
+
+    // Try full name first
     await fillStudent(name);
-    res = await selectStudent();
+    let res = await selectStudent();
+    
     if (!res) {
-    	await fillStudent(removeMiddleName(name));
+      // Try without middle name
+      await fillStudent(NameUtils.removeMiddleName(name));
       res = await selectStudent();
+      
       if (!res) {
-        await fillStudent(getFirstName(name));
+        // Try first name only
+        await fillStudent(NameUtils.getFirstName(name));
         res = await selectStudent();
       }
     }
 
-    if (!res) { alert(`Unable to find definitive student with name: ${name}`); }
+    if (!res) {
+      alert(`❌ Unable to find student: ${name}`);
+      return false;
+    }
+
+    await waitForNameChange(name);
+    return true;
   }
 
   /**
    * Navigate to next student
    */
   async function fillNextStudent(saveGrade = true) {
-    if (isTransitioning) { return; }
-    isTransitioning = true;
-
-    if (saveGrade) { await saveStudentGrade(); }
-
-    if (index >= students.length) {
-      alert("All students graded");
-      isTransitioning = false;
+    if (state.isTransitioning) {
+      console.warn("Already transitioning");
+      return;
+    }
+    
+    if (state.students.length === 0) {
+      alert("⚠️ No students loaded. Please load a group first.");
       return;
     }
 
-    while (index < students.length) {
-      await openSearchToggle();
-      await trySelectingStudentAllPermutations(index);
+    state.isTransitioning = true;
 
-      if (skipCheckbox.checked) {
-        const graded = await isGraded();
-        if (graded) {
-          index++;
-          continue;
-        }
+    try {
+      if (saveGrade) {
+        await saveStudentGrade();
       }
 
-      index++;
-      break;
-    }
+      if (state.index >= state.students.length) {
+        alert("✓ All students graded!");
+        state.isTransitioning = false;
+        return;
+      }
 
-    isTransitioning = false;
+      while (state.index < state.students.length) {
+        await openSearchToggle();
+        const success = await trySelectingStudentAllPermutations(state.index);
+        
+        if (!success) {
+          state.index++;
+          continue;
+        }
+
+        if (dom.skipCheckbox?.checked && isGraded()) {
+          state.index++;
+          continue;
+        }
+
+        if (dom.autoGradeZeros?.checked && !hasPosts()) {
+          focusFirstGradeBox(true);
+          console.log(`Gave ${state.students[state.index]} a 0 for no posts.`);
+          await saveStudentGrade();
+          state.index++;
+          continue;
+        }
+
+        state.index++;
+        scrollToStartSpot();
+        focusFirstGradeBox();
+        break;
+      }
+
+      updateStatus();
+    } catch (err) {
+      console.error("Error in fillNextStudent:", err);
+      alert(`Error navigating to next student: ${err.message}`);
+    } finally {
+      state.isTransitioning = false;
+    }
   }
 
   /**
    * Navigate to previous student
    */
   async function prevStudent() {
-    if (index > 1) {
-      index -= 2;
-      await fillNextStudent();
+    if (state.index > 1) {
+      state.index -= 2;
+      await fillNextStudent(false);
     } else {
-      alert("Already at first student");
+      alert("⚠️ Already at first student");
     }
+  }
+
+  /**
+   * Jump to specific index
+   */
+  async function jumpToIndex(idx) {
+    if (idx < 0 || idx >= state.students.length) {
+      alert(`⚠️ Invalid index: ${idx + 1}`);
+      return;
+    }
+    state.index = idx;
+    await fillNextStudent(false);
   }
 
   /**
@@ -321,10 +517,14 @@
       borderRadius: "4px",
       cursor: "pointer",
       fontSize: "12px",
-      "text-align": "center"
+      textAlign: "center",
+      transition: "opacity 0.2s"
     });
 
+    btn.addEventListener("mouseenter", () => btn.style.opacity = "0.8");
+    btn.addEventListener("mouseleave", () => btn.style.opacity = "1");
     btn.addEventListener("click", onClick);
+    
     return btn;
   }
 
@@ -332,24 +532,37 @@
    * Update status display
    */
   function updateStatus() {
-    status.textContent = `Student ${Math.min(index + 1, students.length)}/${students.length}`;
-    status.title = "Click to jump to specific student";
+    if (!dom.status) return;
 
-    if (nextButton) {
-      nextButton.title = students[index+1] || "No more students";
+    const current = Math.min(state.index + 1, state.students.length);
+    const total = state.students.length;
+    
+    dom.status.textContent = `Student ${current}/${total}`;
+    dom.status.title = "Click to jump to specific student";
+
+    if (dom.nextButton && state.students[state.index]) {
+      dom.nextButton.title = state.students[state.index] || "No more students";
     }
-    if (prevButton) {
-      prevButton.title = students[Math.max(index - 1, 0)] || "At first student";
+    
+    if (dom.prevButton && state.index > 0) {
+      dom.prevButton.title = state.students[state.index - 1] || "At first student";
     }
   }
 
+  /**
+   * Jump popup functionality
+   */
   function showJumpPopup() {
-    if (jumpPopup) { closeJumpPopup(); return; }
+    if (state.jumpPopup) {
+      closeJumpPopup();
+      return;
+    }
 
-    const gradingWindow = document.querySelectorAll(".unified-grader")[0];
+    const gradingWindow = document.querySelector(SELECTORS.gradingWindow);
+    const container = gradingWindow || dom.toolbar;
 
-    jumpPopup = document.createElement("div");
-    Object.assign(jumpPopup.style, {
+    state.jumpPopup = document.createElement("div");
+    Object.assign(state.jumpPopup.style, {
       position: "absolute",
       top: "40px",
       left: "10px",
@@ -358,25 +571,22 @@
       borderRadius: "6px",
       padding: "8px",
       zIndex: "9999999",
-      pointerEvents: "auto",
       boxShadow: "0 2px 8px rgba(0,0,0,0.5)"
     });
 
-    jumpInput = document.createElement("input");
-    Object.assign(jumpInput.style, {
+    state.jumpInput = document.createElement("input");
+    Object.assign(state.jumpInput.style, {
       width: "200px",
-      padding: "4px",
+      padding: "6px",
       fontSize: "13px",
       borderRadius: "4px",
-      pointerEvents: "auto",
-      border: "1px solid #888"
+      border: "1px solid #888",
+      outline: "none"
     });
-    jumpInput.placeholder = "Enter # or name";
-    jumpInput.addEventListener('click', () => {jumpInput.focus({ focusVisible: true });});
+    state.jumpInput.placeholder = "Enter # or name";
 
-    // Results dropdown
-    resultsDropdown = document.createElement("div");
-    Object.assign(resultsDropdown.style, {
+    state.resultsDropdown = document.createElement("div");
+    Object.assign(state.resultsDropdown.style, {
       marginTop: "6px",
       maxHeight: "120px",
       overflowY: "auto",
@@ -384,71 +594,68 @@
       color: "#eee"
     });
 
-    jumpPopup.appendChild(jumpInput);
-    jumpPopup.appendChild(resultsDropdown);
-    if (gradingWindow) { gradingWindow.appendChild(jumpPopup); }
-    else { toolbar.appendChild(jumpPopup); }
+    state.jumpPopup.appendChild(state.jumpInput);
+    state.jumpPopup.appendChild(state.resultsDropdown);
+    container.appendChild(state.jumpPopup);
 
-    jumpInput.focus();
-
-    // Input handlers
-    jumpInput.addEventListener("input", handleJumpSearch);
-    jumpInput.addEventListener("keydown", async (e) => {
+    // Event handlers
+    state.jumpInput.addEventListener("input", debounce(handleJumpSearch, DEBOUNCE_DELAY));
+    state.jumpInput.addEventListener("keydown", async (e) => {
       if (e.key === "Enter") {
-        await executeJump(jumpInput.value.trim());
+        e.preventDefault();
+        await executeJump(state.jumpInput.value.trim());
       } else if (e.key === "Escape") {
+        e.preventDefault();
         closeJumpPopup();
       }
     });
 
-    // Outside click closes
     document.addEventListener("mousedown", outsideClickClose);
-
-//     setTimeout(() => jumpInput.focus({ preventScroll: true }), 50);
+    
+    setTimeout(() => state.jumpInput?.focus(), 50);
   }
 
   function closeJumpPopup() {
-    if (jumpPopup) {
-      jumpPopup.remove();
-      jumpPopup = null;
-      jumpInput = null;
-      resultsDropdown = null;
+    if (state.jumpPopup) {
+      state.jumpPopup.remove();
+      state.jumpPopup = null;
+      state.jumpInput = null;
+      state.resultsDropdown = null;
       document.removeEventListener("mousedown", outsideClickClose);
     }
   }
 
   function outsideClickClose(e) {
-    if (jumpPopup && !jumpPopup.contains(e.target) && e.target !== status) {
+    if (state.jumpPopup && !state.jumpPopup.contains(e.target) && e.target !== dom.status) {
       closeJumpPopup();
     }
   }
 
-
   function handleJumpSearch() {
-    if (!resultsDropdown) { return; }
-    resultsDropdown.innerHTML = "";
+    if (!state.resultsDropdown) return;
+    state.resultsDropdown.innerHTML = "";
 
-    const query = jumpInput.value.trim();
-    if (!query) { return; }
+    const query = state.jumpInput.value.trim();
+    if (!query) return;
 
-    const num = parseInt(query);
-    if (!isNaN(num) && num > 0 && num <= students.length) {
-      const name = students[num - 1];
+    const num = parseInt(query, 10);
+    if (!isNaN(num) && num > 0 && num <= state.students.length) {
+      const name = state.students[num - 1];
       const option = createResultOption(name, num - 1);
-      resultsDropdown.appendChild(option);
+      state.resultsDropdown.appendChild(option);
       return;
     }
 
-    // Otherwise, search names
+    // Search names
     const lowerQuery = query.toLowerCase();
-    const matches = students
+    const matches = state.students
       .map((name, idx) => ({ name, idx }))
       .filter(s => s.name.toLowerCase().includes(lowerQuery))
       .slice(0, 5);
 
     matches.forEach(({ name, idx }) => {
       const option = createResultOption(name, idx);
-      resultsDropdown.appendChild(option);
+      state.resultsDropdown.appendChild(option);
     });
   }
 
@@ -456,60 +663,55 @@
     const div = document.createElement("div");
     div.textContent = `${idx + 1}. ${name}`;
     Object.assign(div.style, {
-      padding: "2px 4px",
-      cursor: "pointer"
+      padding: "4px 6px",
+      cursor: "pointer",
+      borderRadius: "3px"
     });
+    
     div.addEventListener("mouseenter", () => div.style.background = "#444");
     div.addEventListener("mouseleave", () => div.style.background = "transparent");
     div.addEventListener("click", async () => {
       await jumpToIndex(idx);
       closeJumpPopup();
     });
+    
     return div;
   }
 
   async function executeJump(query) {
-    if (!query) { return; }
+    if (!query) return;
 
-    const num = parseInt(query);
-    if (!isNaN(num) && num > 0 && num <= students.length) {
+    const num = parseInt(query, 10);
+    if (!isNaN(num) && num > 0 && num <= state.students.length) {
       await jumpToIndex(num - 1);
       closeJumpPopup();
       return;
     }
 
     const lowerQuery = query.toLowerCase();
-    const idx = students.findIndex(name => name.toLowerCase().includes(lowerQuery));
+    const idx = state.students.findIndex(name => name.toLowerCase().includes(lowerQuery));
+    
     if (idx !== -1) {
       await jumpToIndex(idx);
       closeJumpPopup();
     } else {
-      alert(`No match found for "${query}"`);
+      alert(`❌ No match found for "${query}"`);
     }
   }
-
-  async function jumpToIndex(idx) {
-    index = idx;
-    await fillNextStudent(false);
-  }
-
-
 
   /**
    * Initialize toolbar
    */
   function initializeToolbar() {
-    // Remove existing toolbar if present
+    // Remove existing toolbar
     const existingToolbar = document.querySelector(`.${TOOLBAR_CLASS}`);
-    if (existingToolbar) {
-      existingToolbar.remove();
-    }
+    existingToolbar?.remove();
 
     // Create toolbar
-    toolbar = document.createElement("div");
-    toolbar.classList.add(TOOLBAR_CLASS);
+    dom.toolbar = document.createElement("div");
+    dom.toolbar.classList.add(TOOLBAR_CLASS);
 
-    Object.assign(toolbar.style, {
+    Object.assign(dom.toolbar.style, {
       position: "fixed",
       top: "0",
       left: "0",
@@ -522,44 +724,45 @@
       zIndex: "999999",
       fontFamily: "sans-serif",
       fontSize: "14px",
-      boxShadow: "0 2px 5px rgba(0,0,0,0.2)"
+      boxShadow: "0 2px 5px rgba(0,0,0,0.3)"
     });
 
-    // Add margin to body
     document.body.style.marginTop = "60px";
 
-    // Create minimize button
-    const minimizeButton = createButton("-", () => {
-      isMinimized = !isMinimized;
-      const children = toolbar.querySelectorAll("button, span, label");
+    // Minimize button
+    const minimizeButton = createButton("−", () => {
+      state.isMinimized = !state.isMinimized;
+      const children = dom.toolbar.querySelectorAll("button, span, label");
 
       children.forEach(el => {
         if (el !== minimizeButton) {
-          el.style.display = isMinimized ? "none" : "flex";
+          el.style.display = state.isMinimized ? "none" : "flex";
         }
       });
 
-      minimizeButton.textContent = isMinimized ? "+" : "-";
+      minimizeButton.textContent = state.isMinimized ? "+" : "−";
     }, "#555", "30px");
 
-    // Add the minimize button early so it's before the group buttons
-    toolbar.appendChild(minimizeButton);
+    dom.toolbar.appendChild(minimizeButton);
 
-    // Create the group dropdown
+    // Group buttons
     GROUPS.forEach(group => {
-      if (!group.trim() || group.trim() === "") { return; }
-      const groupButton = createButton(`Load ${group}`, () => loadStudentsFromFile(group), "#042ad1");
-      toolbar.appendChild(groupButton);
+      if (group?.trim()) {
+        const groupButton = createButton(`Load ${group}`, 
+          () => loadStudentsFromFile(group), "#042ad1");
+        dom.toolbar.appendChild(groupButton);
+      }
     });
 
-    prevButton = createButton("⬅ Prev", prevStudent, "#f39c12");
-    nextButton = createButton("➡ Next", fillNextStudent, "#4CAF50");
+    // Navigation buttons
+    dom.prevButton = createButton("⬅ Prev", prevStudent, "#f39c12");
+    dom.nextButton = createButton("➡ Next", fillNextStudent, "#4CAF50");
     const resetButton = createButton("Reset", () => {
-      index = 0;
-      fillNextStudent();
+      state.index = 0;
+      fillNextStudent(false);
     }, "#e74c3c");
 
-    // Create skip checkbox
+    // Skip checkbox
     const skipWrapper = document.createElement("label");
     Object.assign(skipWrapper.style, {
       display: "flex",
@@ -570,48 +773,46 @@
       cursor: "pointer"
     });
 
-    skipCheckbox = document.createElement("input");
-    skipCheckbox.type = "checkbox";
+    dom.skipCheckbox = document.createElement("input");
+    dom.skipCheckbox.type = "checkbox";
+    skipWrapper.appendChild(dom.skipCheckbox);
+    skipWrapper.appendChild(document.createTextNode("Auto-skip graded"));
 
-    const skipText = document.createTextNode("Auto-skip graded");
-    skipWrapper.appendChild(skipCheckbox);
-    skipWrapper.appendChild(skipText);
+    dom.autoGradeZeros = document.createElement("input");
+    dom.autoGradeZeros.type = "checkbox";
+    skipWrapper.appendChild(dom.autoGradeZeros);
+    skipWrapper.appendChild(document.createTextNode("Auto-grade zeros"));
 
-    // Create clickable status
-    status = document.createElement("span");
-    Object.assign(status.style, {
+    // Status display
+    dom.status = document.createElement("span");
+    Object.assign(dom.status.style, {
       marginLeft: "10px",
       fontWeight: "bold",
       color: "white",
       cursor: "pointer",
       padding: "4px 8px",
       borderRadius: "4px",
-      backgroundColor: "rgba(255,255,255,0.1)"
+      backgroundColor: "rgba(255,255,255,0.1)",
+      transition: "background-color 0.2s"
     });
 
-    status.addEventListener("click", () => {
-      showJumpPopup();
+    dom.status.textContent = "Student 0/0";
+    dom.status.addEventListener("click", showJumpPopup);
+    dom.status.addEventListener("mouseenter", () => {
+      dom.status.style.backgroundColor = "rgba(255,255,255,0.2)";
     });
-    status.textContent = "Student 0/0";
-
-    // Add hover effect to status
-    status.addEventListener("mouseenter", () => {
-      status.style.backgroundColor = "rgba(255,255,255,0.2)";
-    });
-    status.addEventListener("mouseleave", () => {
-      status.style.backgroundColor = "rgba(255,255,255,0.1)";
+    dom.status.addEventListener("mouseleave", () => {
+      dom.status.style.backgroundColor = "rgba(255,255,255,0.1)";
     });
 
+    // Append all elements
+    dom.toolbar.appendChild(dom.prevButton);
+    dom.toolbar.appendChild(dom.nextButton);
+    dom.toolbar.appendChild(resetButton);
+    dom.toolbar.appendChild(skipWrapper);
+    dom.toolbar.appendChild(dom.status);
 
-    toolbar.appendChild(prevButton);
-    toolbar.appendChild(nextButton);
-    toolbar.appendChild(resetButton);
-    toolbar.appendChild(skipWrapper);
-    toolbar.appendChild(status);
-
-    // Insert toolbar
-    document.body.insertBefore(toolbar, document.body.firstChild);
-
+    document.body.insertBefore(dom.toolbar, document.body.firstChild);
     updateStatus();
   }
 
@@ -620,7 +821,7 @@
    */
   function setupKeyboardShortcuts() {
     document.addEventListener("keydown", (e) => {
-      if (e.altKey) {
+      if (e.altKey && !e.ctrlKey && !e.shiftKey) {
         switch (e.key) {
           case "=":
           case "+":
@@ -640,14 +841,20 @@
     });
   }
 
-  // Initialize when DOM is ready
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
+  /**
+   * Initialize script
+   */
+  function init() {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => {
+        initializeToolbar();
+        setupKeyboardShortcuts();
+      });
+    } else {
       initializeToolbar();
       setupKeyboardShortcuts();
-    });
-  } else {
-    initializeToolbar();
-    setupKeyboardShortcuts();
+    }
   }
+
+  init();
 })();
