@@ -534,8 +534,8 @@
   function updateStatus() {
     if (!dom.status) return;
 
-    const current = Math.min(state.index + 1, state.students.length);
     const total = state.students.length;
+    const current = state.index;
     
     dom.status.textContent = `Student ${current}/${total}`;
     dom.status.title = "Click to jump to specific student";
